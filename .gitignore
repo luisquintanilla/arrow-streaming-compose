@@ -8,6 +8,8 @@ data/*.csv
 data/*.parquet
 data/*.zip
 data/*.onnx
+models/*.onnx
+models/vocab.txt
 results/*.arrow
 
 # misc

@@ -55,7 +55,7 @@ if (mode == "materialize")
         var amt = Transactions.Amount(batch);
         var isf = Transactions.IsFraud(batch);
         for (int i = 0; i < batch.Length; i++)
-            all.Add(new Txn(acct.GetValue(i)!.Value, step.GetValue(i)!.Value, amt.GetValue(i)!.Value, isf.GetValue(i)!.Value));
+            all.Add(new Txn(acct.GetValue(i)!.Value, step.GetValue(i)!.Value, amt.GetValue(i)!.Value, isf.GetValue(i)!.Value, string.Empty));
         batch.Dispose();
     }
     foreach (var t in all)

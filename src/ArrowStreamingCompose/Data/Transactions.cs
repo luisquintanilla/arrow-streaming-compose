@@ -5,8 +5,9 @@ using Apache.Arrow.Types;
 
 namespace ArrowStreamingCompose.Data;
 
-/// <summary>One transaction event, time-ordered by <see cref="Step"/>. Schema mirrors PaySim's relevant columns.</summary>
-public readonly record struct Txn(long Account, int Step, double Amount, sbyte IsFraud);
+/// <summary>One transaction event, time-ordered by <see cref="Step"/>. Schema mirrors PaySim's relevant columns,
+/// plus a <see cref="Merchant"/> descriptor string (the real text field an auth carries) for the S9 text path.</summary>
+public readonly record struct Txn(long Account, int Step, double Amount, sbyte IsFraud, string Merchant);
 
 /// <summary>
 /// PaySim-SHAPED transaction generator + Arrow IPC writer. The schema and feature semantics mirror the real
@@ -23,7 +24,26 @@ public static class Transactions
         .Field(new Field("step", Int32Type.Default, nullable: false))
         .Field(new Field("amount", DoubleType.Default, nullable: false))
         .Field(new Field("isFraud", Int8Type.Default, nullable: false))
+        .Field(new Field("merchant", StringType.Default, nullable: false))
         .Build();
+
+    // Merchant-descriptor pools. Normal txns draw from everyday merchants; fraud bursts draw mostly from a small
+    // set of "risky" descriptors (gift-card / crypto / wire / reload language) so a text embedding of the merchant
+    // carries a learnable fraud signal — the whole point of the S9 text-similarity feature.
+    private static readonly string[] NormalMerchants =
+    {
+        "WALMART GROCERY", "AMZN MKTP US", "STARBUCKS STORE", "SHELL OIL", "TARGET STORE",
+        "COSTCO WHSE", "UBER TRIP", "NETFLIX SUBSCRIPTION", "MCDONALDS", "HOME DEPOT",
+        "BEST BUY", "DELTA AIR LINES", "WHOLE FOODS MKT", "CVS PHARMACY", "SPOTIFY USA",
+        "APPLE STORE", "CHIPOTLE", "TRADER JOES", "LYFT RIDE", "EXXONMOBIL",
+    };
+
+    private static readonly string[] RiskyMerchants =
+    {
+        "GIFTCARD SUPPLY LTD", "CRYPTO EXCHANGE GLOBAL", "WIRE TRANSFER SVC", "PREPAID RELOAD CENTER",
+        "OFFSHORE BETTING CO", "INSTANT CASHOUT INC", "DIGITAL WALLET TOPUP", "ANON VPN SERVICES",
+    };
+
 
     public sealed class Options
     {
@@ -66,7 +86,8 @@ public static class Transactions
                 double u = rng.NextDouble();
                 long acct = (long)(opt.Accounts * u * u);
                 double amount = LogNormal(rng, meanLog: 5.0, sigma: 1.1);   // ~ a few hundred, heavy tail
-                yield return new Txn(acct, step, Math.Round(amount, 2), 0);
+                string merchant = NormalMerchants[rng.Next(NormalMerchants.Length)];
+                yield return new Txn(acct, step, Math.Round(amount, 2), 0, merchant);
             }
 
             if (burstAtStep.TryGetValue(step, out var fraudList))
@@ -74,7 +95,11 @@ public static class Transactions
                 foreach (var acct in fraudList)
                 {
                     double amount = LogNormal(rng, meanLog: 7.0, sigma: 0.8); // larger tickets during fraud
-                    yield return new Txn(acct, step, Math.Round(amount, 2), 1);
+                    // 85% of fraud txns hit a risky merchant; the rest look normal (so text isn't a perfect tell).
+                    string merchant = rng.NextDouble() < 0.85
+                        ? RiskyMerchants[rng.Next(RiskyMerchants.Length)]
+                        : NormalMerchants[rng.Next(NormalMerchants.Length)];
+                    yield return new Txn(acct, step, Math.Round(amount, 2), 1, merchant);
                 }
             }
         }
@@ -92,6 +117,7 @@ public static class Transactions
         var step = new Int32Array.Builder();
         var amount = new DoubleArray.Builder();
         var fraud = new Int8Array.Builder();
+        var merchant = new StringArray.Builder();
         int n = 0;
 
         void Flush()
@@ -99,17 +125,18 @@ public static class Transactions
             if (n == 0) return;
             var batch = new RecordBatch(Schema, new IArrowArray[]
             {
-                acct.Build(alloc), step.Build(alloc), amount.Build(alloc), fraud.Build(alloc),
+                acct.Build(alloc), step.Build(alloc), amount.Build(alloc), fraud.Build(alloc), merchant.Build(alloc),
             }, n);
             writer.WriteRecordBatch(batch);
             batch.Dispose();
-            acct.Clear(); step.Clear(); amount.Clear(); fraud.Clear();
+            acct.Clear(); step.Clear(); amount.Clear(); fraud.Clear(); merchant.Clear();
             n = 0;
         }
 
         foreach (var t in txns)
         {
             acct.Append(t.Account); step.Append(t.Step); amount.Append(t.Amount); fraud.Append(t.IsFraud);
+            merchant.Append(t.Merchant);
             total++;
             if (++n >= batchSize) Flush();
         }
@@ -123,6 +150,7 @@ public static class Transactions
     public static Int32Array Step(RecordBatch b) => (Int32Array)b.Column("step");
     public static DoubleArray Amount(RecordBatch b) => (DoubleArray)b.Column("amount");
     public static Int8Array IsFraud(RecordBatch b) => (Int8Array)b.Column("isFraud");
+    public static StringArray Merchant(RecordBatch b) => (StringArray)b.Column("merchant");
 
     private static int Poisson(Random rng, double lambda)
     {
