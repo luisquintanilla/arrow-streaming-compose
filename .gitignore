@@ -1,0 +1,15 @@
+# build output
+bin/
+obj/
+
+# generated / fetched data + model artifacts (provenance via scripts, never commit binaries)
+data/*.arrow
+data/*.csv
+data/*.parquet
+data/*.zip
+data/*.onnx
+results/*.arrow
+
+# misc
+*.user
+.DS_Store
