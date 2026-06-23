@@ -4,9 +4,21 @@ A throwaway **validation experiment**: can a streaming / LINQ composition layer 
 SIMD kernels serve a real **card-fraud feature pipeline** entirely in-process in .NET — killing **train/serve skew**
 and keeping card data inside the .NET service boundary?
 
-It does **not** ship a framework. It runs five small spikes against one concrete business process and produces an
+It does **not** ship a framework. It runs small spikes against one concrete business process and produces an
 honest [`results/DECISION.md`](results/DECISION.md): where this layer helps, where it doesn't, and where it must
 hand off to a real engine.
+
+> ### Start here: [`results/WHY.md`](results/WHY.md)
+> If you have never thought about `IObservable`, LINQ, and Apache Arrow as **one design**, read the why first.
+> It answers the *so what*: why two stream shapes (pull/push), why LINQ as a single query algebra across both,
+> why Arrow as the standard substrate that lets SIMD kernels and the AI primitives (Tokenizers, ONNX, MEAI,
+> MEVD) share buffers with no copy, and a precise **gap map (G1–G7)** of where the .NET / AI ecosystem is still
+> thin. The fraud scenario below is just the ground; the WHY is the point.
+
+**The one-line answer:** these primitives compose into a single, .NET-native, **in-process data-and-AI plane** —
+write the feature graph **once**, run it over both historical (pull) and live (push) data at SIMD speed, fuse a
+text-derived feature via ONNX, and never copy card data into Spark/Flink/pandas. What's real today is the
+composition; what's missing is plumbing (a columnar LINQ provider, a fuller kernel set, an Arrow-native AI bridge).
 
 > Origin: a reviewer of [apache/arrow-dotnet#379](https://github.com/apache/arrow-dotnet/pull/379) (a SIMD
 > aggregation-kernel PR) asked *"what if this was IObservable and projected into some fancy LINQ?"* This repo tests
@@ -35,9 +47,10 @@ src/ArrowStreamingCompose/      # the small shared library
   Features/CardVelocityFeatures #   THE single feature definition (define-once)
   Streaming/VelocityEngine.cs   #   per-card stateful window — the literal define-once artifact (S1 == S3)
   Streaming/ArrowStream.cs      #   IPC → IAsyncEnumerable (pull) + IObservable (push, Rx)
+  Streaming/ArrowQuery.cs       #   S10: deferred columnar-LINQ -> Arrow kernels sketch (the G1 proof)
   Streaming/PartialAggregates   #   combinable streaming aggregates
   Scoring/LogisticScorer.cs     #   Track-1 scorer: sigmoid(TensorPrimitives.Dot(features,w)+b), weights FIT
-  Data/Transactions.cs          #   PaySim-shaped generator + Arrow IPC writer
+  Data/Transactions.cs          #   PaySim-shaped generator + Arrow IPC writer (+ merchant text column)
 spikes/                         # .NET 10 file-based apps (dotnet run x.cs)
   gen-data.cs                   #   produce the offline Arrow IPC dataset
   s1-offline-backfill.cs        #   S1: streaming backfill vs full-materialize
@@ -45,7 +58,12 @@ spikes/                         # .NET 10 file-based apps (dotnet run x.cs)
   s3-online-scoring.cs          #   S3: per-event latency p50/p99 + state footprint
   s4-define-once.cs             #   S4: byte-identical features pull vs push (skew test)
   s5-build-vs-buy.cs            #   S5: managed group-by vs embedded DuckDB
+  s8-ergonomics.cs              #   S8: hand-rolled vs LINQ.Async (pull) vs Rx (push) — why LINQ, where (G6)
+  s9-ai-composition.cs          #   S9: merchant text -> Tokenizers + ONNX MiniLM + MEAI/MEVD, fused feature (G7)
+  s10-linq-arrow.cs             #   S10: columnar-LINQ vs row-LINQ over the same Arrow file (G1)
 data/                           # generated/fetched data (gitignored; see fetch-paysim.sh)
+models/                         # MiniLM ONNX + vocab for S9 (gitignored; see fetch-minilm.sh)
+results/WHY.md                  # the conceptual unlock + G1–G7 gap map (read first)
 results/DECISION.md             # S6: the honest decision memo
 ```
 
@@ -66,6 +84,12 @@ dotnet run s2-push-vs-pull.cs     -- ../data/transactions.arrow push
 dotnet run s3-online-scoring.cs   -- ../data/transactions.arrow
 dotnet run s4-define-once.cs      -- ../data/transactions.arrow
 dotnet run s5-build-vs-buy.cs     -- ../data/transactions.arrow
+
+# 3. the "why" spikes (ergonomics, AI composition, columnar-LINQ)
+dotnet run s8-ergonomics.cs       -- ../data/transactions.arrow
+dotnet run s10-linq-arrow.cs      -- ../data/transactions.arrow
+#    S9 needs the MiniLM model: bash ../models/fetch-minilm.sh   (then:)
+dotnet run s9-ai-composition.cs   -- ../data/transactions.arrow
 ```
 
 The spikes run on a **PaySim-shaped, volume-synthesized** dataset by default (real schema and feature semantics,
@@ -85,6 +109,14 @@ See [`results/DECISION.md`](results/DECISION.md) for the full memo. In short, on
   and no durable/shared per-card state — it's a compute path, not a feature store.
 - **Surge robustness** (S2): pull has native backpressure (flat memory); Rx push does not (unbounded queue).
 - **Build-vs-buy** (S5): global group-by/joins still belong in embedded DuckDB; windowed features stay managed.
+- **Why LINQ, where** (S8): hand-rolled, pull-LINQ, and push-Rx produce **byte-identical** features (one query
+  algebra across the pull/push duality), but operators run **2–3× slower** and the causal window is hand-rolled (gap G6).
+- **AI composition is real** (S9): merchant text → Tokenizers + ONNX MiniLM (behind a MEAI `IEmbeddingGenerator`) →
+  fused similarity feature lifts model **AUC 0.954 → 0.984**; a `TensorPrimitives` cosine scan beat the vector store
+  **~7.6×** with identical results. The seam: MEAI/MEVD aren't Arrow-native (gap G7).
+- **Columnar LINQ would be the big unlock** (S10): a deferred query lowered to column spans + SIMD kernels ran
+  **2.44×** faster than idiomatic row-LINQ on the same Arrow file, with identical answers — but .NET has no such
+  provider yet (gap G1).
 
 ## Scope
 

@@ -1,5 +1,8 @@
 # DECISION — should a card-fraud team run its feature pipeline as a streaming/LINQ Arrow layer in .NET?
 
+> **New here? Read [`WHY.md`](WHY.md) first.** This memo is the *what we chose*. WHY.md is the *so what*: why the
+> pull/push duality, why LINQ as one query algebra, why Arrow as the shared substrate, and the G1–G7 gap map.
+
 **Verdict: strong offline, viable-but-caveated online, and the train/serve-skew win is real.**
 
 Expressing the velocity feature graph **once** and running it over both a pull stream (offline backfill) and a
@@ -15,7 +18,9 @@ Machine: 11th Gen Intel i9-11950H, 16 threads, .NET 10.0.100. Dataset: **5,003,6
 (real schema/semantics: per-account key, hourly `step`, `amount`, `isFraud`), **volume-synthesized** for offline
 determinism, fraud injected as per-account bursts (**6,788 fraud rows, 0.136%**, 200,000 accounts, 744 steps).
 Numbers are illustrative of one box and single runs, not a benchmark suite. Every number comes from a run on the
-named data via the `spikes/*.cs` file-based apps.
+named data via the `spikes/*.cs` file-based apps. The why-spikes (S8–S10) and the AI track run on a regenerated
+dataset that adds a **`merchant` descriptor text column** (**5,008,756** rows; numeric-only baseline AUC **0.9544**),
+so the text-feature lift in S9 is measured against that same baseline.
 
 ---
 
@@ -96,6 +101,71 @@ API**, so loading 5 M rows costs a **~1.3 s row-by-row tax** that erases the win
 Aggregates match within FP summation-order tolerance (parity confirmed). **Seam:** windowed per-event features stay
 in the managed Arrow/streaming layer (no shuffle, bounded memory, define-once); global group-by, dimension joins,
 and the label join go to embedded DuckDB when the data is already resident or reused across many queries.
+
+### S8 — Ergonomics: why LINQ, where (hand-rolled vs LINQ.Async vs Rx) → **LINQ for composition, kernel for the hot loop**
+The same per-card velocity feature, three ways over the same stream:
+
+| Approach | Throughput | Feature-logic LOC | Checksum |
+|---|---:|---:|---|
+| hand-rolled `VelocityEngine` batch loop | **1.23 M rows/s** | 16 | `B6DB07E9B0425424` |
+| pull — `System.Linq.Async` `GroupBy` | 0.54 M rows/s | 34 | `B6DB07E9B0425424` |
+| push — Rx `GroupBy` + `Scan` | 0.42 M rows/s | 36 | `B6DB07E9B0425424` |
+
+All three produce **byte-identical** features (over 5,008,756 rows). LINQ is one query algebra across the pull/push
+duality: the same `GroupBy(card)` pipeline reads almost identically whether the source is `IAsyncEnumerable` (pull)
+or `IObservable` (push). That symmetry is the .NET-native unlock. The cost is honest: operators run **2–3× slower**
+(per-element, allocating) and there is **no Arrow-batch-aware causal window operator** in the box, so you hand-roll
+the window inside `Scan` (gap **G6**). Use LINQ to *compose the graph*; drop to the kernel for the throughput-critical
+inner loop.
+
+### S9 — AI-primitive composition (text feature on the same Arrow row) → **GO; the lift is real, the seam is G7**
+Merchant-descriptor text → `Microsoft.ML.Tokenizers` (BertTokenizer) → ONNX Runtime (MiniLM) → mean-pool + L2-norm →
+cosine similarity to fraud-cluster centroids → fused as a 6th feature → refit the logistic scorer:
+
+| Metric | Numeric only (5 feats) | Numeric + text (6 feats) |
+|---|---:|---:|
+| Model AUC | 0.9544 | **0.9835** (+0.0291) |
+
+| Nearest-cluster lookup | Time | Result |
+|---|---:|---|
+| `TensorPrimitives` cosine scan (contiguous `float[]`) | **33 ms** | 28/28 agree |
+| vector-store-shaped object lookup (MEVD shape) | 251 ms | 28/28 agree |
+
+The first-party AI building blocks **compose**: Tokenizers + ONNX + `System.Numerics.Tensors` snap together behind a
+`Microsoft.Extensions.AI` `IEmbeddingGenerator`, and the text signal buys real accuracy. For small candidate sets a
+`TensorPrimitives` scan beats reaching for a store (**~7.6×**, identical results). **Seam (G7):** MEAI/MEVD are not
+Arrow-native — embeddings live in `float[]`/record objects, so you marshal out of the columnar substrate and back.
+(`Microsoft.Extensions.VectorData` in-memory connector is preview-only and fought version pinning; S9 used a shim
+with the same abstraction shape — itself a finding.)
+
+### S10 — Columnar-LINQ → Arrow provider sketch (the G1 proof) → **the highest-leverage missing piece**
+The same `Where(amount > 200).Sum/Max`, two ways over the same Arrow file:
+
+| Approach | Throughput | Time | Result |
+|---|---:|---:|---|
+| row — `IEnumerable<T>` LINQ-to-Objects | 7.42 M rows/s | 0.68 s | identical |
+| **column — `ArrowQuery` lowered to spans + kernels** | **18.10 M rows/s** | **0.28 s** | identical |
+
+A deferred query that lowers `Where/Select/Aggregate` straight onto column spans and `TensorPrimitives` ran **2.44×
+faster** than idiomatic row-LINQ on the same bytes, with **identical answers** (unfiltered count of all 5,008,756 rows:
+0.11 s as one kernel pass per batch). The row path can't take it: it rehydrates a managed object and invokes a delegate
+per element by construction. .NET has **no columnar LINQ provider** (gap **G1**) — building one (plus a fuller kernel
+set, G2) would make this fast path the *default* path. The sketch enumerates what a real `IQueryable` Arrow provider
+still needs (expression-tree parsing, predicate fusion, validity propagation, typed-kernel dispatch, GroupBy/Join
+lowering, Arrow-in/Arrow-out).
+
+---
+
+## The gap map (G1–G7)
+The honest map of where the first-party primitives stop and you hand-roll. Full version in [`WHY.md`](WHY.md).
+
+- **G1** No columnar LINQ provider — row LINQ over Arrow is 2.44× slower than a column lowering (S10).
+- **G2** Arrow .NET compute kernels are sparse (Sum/Min/Max/Mean only; no filter/take/sort/group/join) (S10, S8).
+- **G3** No complete pure-managed columnar IO story (used Arrow IPC).
+- **G4** No Arrow-native ingest into the embedded engine — DuckDB pays a ~1.3 s ingest tax (S5).
+- **G5** ML.NET `IDataView` ↔ Arrow impedance (scoring sidesteps `IDataView` via `TensorPrimitives.Dot`).
+- **G6** Rx/LINQ have no backpressure-aware, Arrow-batch-aware window operator (S2, S8).
+- **G7** MEAI/MEVD don't speak Arrow — embeddings/vectors live outside the columnar substrate (S9).
 
 ---
 
