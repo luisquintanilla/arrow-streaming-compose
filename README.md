@@ -123,3 +123,20 @@ See [`results/DECISION.md`](results/DECISION.md) for the full memo. In short, on
 This is an experiment, not a product. The model is a cheap fitted logistic placeholder; the data is volume-
 synthesized; the numbers are illustrative of one machine. The point is the **decision**, on real-shaped data, for
 each step of the fraud feature pipeline.
+
+## License & attribution
+
+Copyright 2026 Luis Quintanilla. This repository's own code and docs are licensed under the
+**[Apache License 2.0](LICENSE)**.
+
+It builds on the following, each under its own license:
+
+- **Vendored kernel** — `src/ArrowStreamingCompose/Kernels/Aggregations.cs` is a by-value copy of the Apache
+  Arrow .NET compute kernel, **Apache-2.0** (original header preserved in the file; provenance in
+  [`Kernels/VENDORED.md`](src/ArrowStreamingCompose/Kernels/VENDORED.md)).
+- **Model** — `all-MiniLM-L6-v2` (fetched by `models/fetch-minilm.sh`, **not** committed), **Apache-2.0**.
+- **Dataset** — [PaySim](https://www.kaggle.com/datasets/ealaxi/paysim1) (fetched by `data/fetch-paysim.sh`,
+  **not** committed; the default dataset here is PaySim-*shaped* synthetic data), **CC BY-SA 4.0**.
+- **NuGet dependencies** — Apache Arrow, `System.Reactive`, `System.Linq.Async`, `Microsoft.ML.OnnxRuntime`,
+  `Microsoft.ML.Tokenizers`, `Microsoft.Extensions.AI`, and `Microsoft.Extensions.VectorData`, each under their
+  respective licenses.
