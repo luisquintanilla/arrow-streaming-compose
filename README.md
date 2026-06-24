@@ -54,7 +54,7 @@ src/ArrowStreamingCompose/      # the small shared library
 spikes/                         # .NET 10 file-based apps (dotnet run x.cs)
   gen-data.cs                   #   produce the offline Arrow IPC dataset
   s1-offline-backfill.cs        #   S1: streaming backfill vs full-materialize
-  s2-push-vs-pull.cs            #   S2: backpressure under a slow consumer
+  s2-push-vs-pull.cs            #   S2: pull vs push under load + the precise Rx backpressure truth (5 modes)
   s3-online-scoring.cs          #   S3: per-event latency p50/p99 + state footprint
   s4-define-once.cs             #   S4: byte-identical features pull vs push (skew test)
   s5-build-vs-buy.cs            #   S5: managed group-by vs embedded DuckDB
@@ -107,7 +107,10 @@ See [`results/DECISION.md`](results/DECISION.md) for the full memo. In short, on
   and identical model AUC (≈ 0.95).
 - **Online scoring → viable, caveated** (S3): **~0.4 µs median** per-event score, but a GC tail (~25 ms outlier)
   and no durable/shared per-card state — it's a compute path, not a feature store.
-- **Surge robustness** (S2): pull has native backpressure (flat memory); Rx push does not (unbounded queue).
+- **Surge robustness & the real Rx backpressure story** (S2): pull is lock-step (backlog 1, 55 MiB). Rx has no
+  *demand* backpressure, but the unbounded queue (204 MiB) is a *decoupling* artifact: a **synchronous** Rx
+  subscription is lock-step too (backlog 1), Rx's built-in shedding (`Sample`) is **lossy** (drops 73/77 batches),
+  and the non-lossy fix for a decoupled pipeline is a **bounded `Channel`** bridge (flat memory, zero loss).
 - **Build-vs-buy** (S5): global group-by/joins still belong in embedded DuckDB; windowed features stay managed.
 - **Why LINQ, where** (S8): hand-rolled, pull-LINQ, and push-Rx produce **byte-identical** features (one query
   algebra across the pull/push duality), but operators run **2–3× slower** and the causal window is hand-rolled (gap G6).

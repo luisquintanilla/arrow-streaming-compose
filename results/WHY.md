@@ -49,12 +49,30 @@ The offline job is naturally pull. The online job is naturally push. That is **w
 why a pipeline that has to live in both worlds needs both shapes rather than picking one.
 
 **What this unlocks, and where:** the choice is not cosmetic. It has a hard operational consequence we
-measured. Under a slow consumer (an auth surge), **pull gives you backpressure for free**: the producer
-cannot outrun the consumer, so memory stays flat (S2: 1 batch in flight, 53 MiB). **Push does not**:
-stock Rx queues the backlog unbounded (S2: 74 of 77 batches in flight, 139 MiB, an OOM on a long enough
-surge). So the duality is not just elegant. It tells you *pull belongs on the backfill, and push on the
-edge only if you add bounded buffering or load-shedding*. That is a design rule you get from taking the
-two shapes seriously, not from a framework.
+measured, and it is worth being precise about because the easy version of this claim is wrong. Under a slow
+consumer (an auth surge), **pull gives you backpressure for free**: the consumer `await`s each batch, so the
+producer cannot outrun it and memory stays flat (S2: 1 batch in flight, 55 MiB).
+
+The tempting next sentence is "and push does not." That is too strong. The precise truth is that **Rx.NET has no
+_demand-based_ backpressure** (an observer cannot tell the source to slow down, the way Reactive Streams'
+`request(n)` does), but it still has flow control:
+
+- **Synchronous Rx is lock-step by default.** With no scheduler, `OnNext` is a blocking call, so a slow observer
+  blocks the producer just like pull does (S2 `push-sync`: 1 batch in flight, 61 MiB). The unbounded queue only
+  appears when you **decouple** producer and consumer with a scheduler (`ObserveOn`) or an async source — which is
+  exactly what a real live feed is (S2 `push`: 71 of 77 batches queued, 204 MiB, an OOM on a long enough surge).
+  So the blow-up is a *decoupling* artifact, not proof that "Rx can't throttle."
+- **Rx's built-in flow control is lossy.** `Sample`/`Throttle`/`Buffer`/`Window` bound memory by *dropping or
+  aggregating* (S2 `push-lossy`: flat 51 MiB, but 73 of 77 batches dropped). Fine for telemetry; unacceptable for
+  fraud, where every authorization must be scored.
+- **The non-lossy fix for a decoupled pipeline is a bounded buffer, not an Rx operator.** Bridge the producer
+  through a bounded `System.Threading.Channels` channel and it `await`s when full (S2 `push-bounded`: flat 73 MiB,
+  zero loss). `Subscribe` controls the subscription's *lifetime*, not its *rate*.
+
+So the duality is not just elegant; it tells you a concrete design rule: *pull belongs on the backfill; a live push
+edge must either stay synchronous, add a bounded `Channel` bridge, or fall back to pull — and must never rely on a
+decoupled Rx push with no bound.* That is a rule you get from taking the two shapes (and Rx's actual semantics)
+seriously, not from a framework.
 
 ## Why LINQ: one query algebra across both shapes
 
@@ -159,17 +177,18 @@ primitives stop and you are on your own.
 | **G3** | No **pure-managed Parquet/Arrow IO** story that is first-party and complete. | We used Arrow IPC; broader columnar IO still leans on native or third-party. | A self-contained .NET service shouldn't need native glue to read its own columnar files. |
 | **G4** | No **Arrow-native ingest into the embedded engine**. DuckDB is great but you pay an ingest tax. | S5: DuckDB group-by ~100 ms but ~1.3 s to ingest; managed stayed ~650 ms to 1.1 s with no copy. | The "drop to DuckDB for global aggregates" answer is real, but the Arrow→engine boundary is not free. |
 | **G5** | **ML.NET `IDataView` ↔ Arrow** impedance. The ML stack has its own columnar view that is not Arrow. | Scoring here is a hand-fit logistic on `TensorPrimitives.Dot`, sidestepping `IDataView` entirely. | Two columnar models in one runtime that don't share memory is a copy and a concept tax. |
-| **G6** | **Rx / LINQ have no backpressure-aware, Arrow-batch-aware window operator.** | S2: push queued unbounded under load. S8: the causal window was hand-rolled inside `Scan` in both pull and push. | The pull/push symmetry is real, but the streaming windowing that fraud features need is not in the box. |
+| **G6** | **Rx / LINQ have no _demand_ backpressure and no Arrow-batch-aware window operator.** | S2: a *decoupled* push queued unbounded (204 MiB) while synchronous push and a bounded `Channel` bridge stayed flat; Rx's own shedding (`Sample`) dropped 73/77 batches. S8: the causal window was hand-rolled inside `Scan` in both pull and push. | You can get non-lossy flow control (sync, bounded `Channel`, or pull), but not from Rx itself; and the streaming windowing fraud features need is not in the box. |
 | **G7** | **MEAI / MEVD don't speak Arrow.** Embeddings and vector records live outside the columnar substrate. | S9: constant marshaling Arrow column → strings → ONNX → `float[]` → store records; AUC lift was real but the seam was manual. | This is what stops "AI features on the same Arrow row" from being seamless. An Arrow-native embedding/vector path would close it. |
 
 ---
 
 ## The honest bottom line
 
-What is **real** today: the pull/push duality with its backpressure consequence (S2), LINQ as one query
-algebra that makes pull and push byte-identical (S8, S4), Arrow as the standard substrate that lets SIMD
-kernels and ONNX share buffers with no copy (S10, S9), and a genuine accuracy lift from composing
-Tokenizers + ONNX + Tensors behind the MEAI abstraction (S9, AUC 0.954 → 0.984).
+What is **real** today: the pull/push duality with its precise flow-control consequences (S2: pull and
+synchronous Rx are lock-step, a decoupled Rx push needs a bounded `Channel` or it queues unbounded, and Rx's own
+shedding is lossy), LINQ as one query algebra that makes pull and push byte-identical (S8, S4), Arrow as the
+standard substrate that lets SIMD kernels and ONNX share buffers with no copy (S10, S9), and a genuine accuracy
+lift from composing Tokenizers + ONNX + Tensors behind the MEAI abstraction (S9, AUC 0.954 → 0.984).
 
 What is **still missing** is plumbing, not physics: a columnar LINQ provider (G1) and a fuller kernel set
 (G2) would make the fast path the default, and an Arrow-native bridge for the AI primitives (G7) would

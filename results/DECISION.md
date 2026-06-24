@@ -9,8 +9,9 @@ Expressing the velocity feature graph **once** and running it over both a pull s
 push stream (online scoring) **eliminated train/serve skew structurally** (byte-identical features, S4), kept the
 backfill's memory **~3× below** full-materialize (S1), and scored each authorization in **~0.4 µs median** (S3).
 The honest limits: the online path's **per-card state has no durability/failover** (a feature store still owns
-that), managed **GC produced a ~25 ms latency outlier** (S3 tail), Rx **push has no backpressure** so a surge
-queues unbounded (S2), and **global group-by/joins still belong in DuckDB** (S5). Adopt the managed Arrow layer for
+that), managed **GC produced a ~25 ms latency outlier** (S3 tail), a **decoupled** Rx push has **no demand
+backpressure** so it queues unbounded unless you add a bounded buffer (S2), and **global group-by/joins still
+belong in DuckDB** (S5). Adopt the managed Arrow layer for
 the windowed feature pass and the define-once contract; keep DuckDB for global aggregates and add a durable state
 store for online serving.
 
@@ -39,17 +40,35 @@ Streaming holds peak **~3.1× lower** at the **same throughput** and **identical
 AUC ≈ 0.95 confirms the velocity features carry real fraud signal, so the pipeline is meaningful, not a toy. A
 .NET team can build the training feature table in-process instead of a Spark job — for the windowed-feature slice.
 
-### S2 — Auth-surge robustness (push vs pull, slow consumer) → **GO for pull, CAUTION for push**
-With a deliberately slow scorer (25 ms/batch):
+### S2 — Auth-surge robustness, and the precise truth about Rx backpressure → **GO for pull / bounded-bridge; the unbounded queue is a *decoupling* artifact, not "Rx can't throttle"**
+The careful claim: **Rx.NET has no _demand-based_ (Reactive-Streams) backpressure** — an observer cannot tell the
+producer to slow down. But that is not the same as "Rx always queues unbounded." With a deliberately slow scorer
+(25 ms/batch), five configurations over the same stream:
 
-| Path | Max in-flight backlog | Peak working set |
-|---|---:|---:|
-| **pull** (`IAsyncEnumerable`) | **1 batch** | 53 MiB |
-| push (`IObservable` + `ObserveOn`) | 74 of 77 batches | 139 MiB |
+| Mode | What it is | Max backlog | Dropped | Peak working set |
+|---|---|---:|---:|---:|
+| **pull** (`IAsyncEnumerable`) | `await foreach`, lock-step | **1 batch** | 0 | **55 MiB** |
+| push (decoupled) | `ObserveOn` + async producer | 71 of 77 | 0 | 204 MiB |
+| **push-sync** | synchronous `Observable.Create`, no scheduler | **1 batch** | 0 | 61 MiB |
+| **push-bounded** | bounded `System.Threading.Channels` bridge (cap 4) | 6 batches | 0 | 73 MiB |
+| push-lossy | Rx `Sample`/`Throttle` | n/a (dropped) | **73 of 77** | 51 MiB |
 
-Pull has **native backpressure** — the producer can't outrun the consumer, so memory stays flat through a surge.
-Rx push has **no built-in backpressure**: a slow consumer lets nearly the whole dataset queue (2.6× the memory
-here; an OOM on a long-enough surge). **If the online path is push, it must add bounded buffering / load-shedding.**
+What the numbers actually say:
+- **The unbounded queue is caused by _decoupling_, not by Rx push per se.** The `push` row blows up to 204 MiB
+  only because we add `ObserveOn(EventLoopScheduler)` plus an async producer, which is exactly what a real live
+  feed does. Take the scheduler away (`push-sync`) and **Rx is lock-step by default** — `OnNext` is a blocking
+  call, so the producer can't outrun the consumer (backlog 1, flat memory), just like pull. ("Isn't there a way to
+  subscribe and throttle?" Yes: stay synchronous.)
+- **Rx's own flow-control operators are lossy.** `push-lossy` keeps memory flat (51 MiB) but **drops 73 of 77
+  batches** (`Sample` keeps only the latest per window). Fine for telemetry; unacceptable for fraud, where every
+  authorization must be scored.
+- **The non-lossy fix for a decoupled pipeline is a bounded buffer, not an Rx operator.** `push-bounded` bridges
+  the async producer through a bounded `Channel<RecordBatch>`; the producer `await`s `WriteAsync` when full, giving
+  real backpressure across the thread boundary — **flat memory, zero loss.**
+
+So: if the online path is a decoupled Rx push, it must add bounded buffering (`System.Threading.Channels`) or fall
+back to pull (`IAsyncEnumerable`); `Subscribe` controls the subscription's *lifetime*, not its *rate*. Lossy
+shedding is the only thing Rx gives you in the box, and fraud can't use it.
 
 ### S3 — Online velocity scoring (the hard one) → **VIABLE, with caveats**
 Per-card rolling velocity over the live push stream, featurized (define-once) and scored by the Track-1 logistic
@@ -164,7 +183,7 @@ The honest map of where the first-party primitives stop and you hand-roll. Full 
 - **G3** No complete pure-managed columnar IO story (used Arrow IPC).
 - **G4** No Arrow-native ingest into the embedded engine — DuckDB pays a ~1.3 s ingest tax (S5).
 - **G5** ML.NET `IDataView` ↔ Arrow impedance (scoring sidesteps `IDataView` via `TensorPrimitives.Dot`).
-- **G6** Rx/LINQ have no backpressure-aware, Arrow-batch-aware window operator (S2, S8).
+- **G6** Rx/LINQ have no *demand* backpressure and no Arrow-batch-aware window operator; a decoupled push needs a bounded `Channel` (S2, S8).
 - **G7** MEAI/MEVD don't speak Arrow — embeddings/vectors live outside the columnar substrate (S9).
 
 ---
@@ -184,7 +203,9 @@ The honest map of where the first-party primitives stop and you hand-roll. Full 
 ## What it does NOT solve (read this before adopting)
 - **Online state durability/failover/sharing** — the in-process per-card dictionary is not a feature store (S3).
 - **GC latency tail** — a ~25 ms outlier exists; an online SLA must budget for managed-GC pauses (S3).
-- **Backpressure on the push path** — Rx does not provide it; a surge queues unbounded without explicit bounding (S2).
+- **Backpressure on a decoupled push path** — Rx has no *demand* backpressure, so a scheduler-decoupled producer
+  queues unbounded; bound it with `System.Threading.Channels` or use pull. (A *synchronous* Rx pipeline is
+  lock-step, and Rx's built-in `Sample`/`Throttle` shedding is lossy — unusable when every auth must be scored.) (S2)
 - **Global group-by / joins at scale** — slower than DuckDB once resident; hand those off (S5).
 - **Event disorder** — the define-once guarantee is proven for in-order events; late/out-of-order events at the
   real auth edge are an open follow-up (S4).
